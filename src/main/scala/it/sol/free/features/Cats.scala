@@ -10,6 +10,9 @@ case class AddItem(name: String) extends DataOp[Unit]
 case class ValidateItem(item: String) extends DataOp[Boolean]
 case class GetAllItems() extends DataOp[List[String]]
 
+sealed trait SomethingElse[A] extends Product with Serializable
+case class DoSomethingElse() extends SomethingElse[Unit]
+
 // Free and lifting
 import cats.free.{Free, Inject}
 
@@ -21,6 +24,7 @@ import scalaz.\/-
 
 class Interactions[F[_]](implicit I: Inject[Interaction, F]) {
   def ask(prompt: String): Free[F, String] = Free.inject[Interaction, F](Ask(prompt))
+
   def tell(message: String): Free[F, Unit] = Free.inject[Interaction, F](Tell(message))
 }
 
@@ -30,12 +34,22 @@ object Interactions {
 
 class DataSource[F[_]](implicit I: Inject[DataOp, F]) {
   def addItem(name: String): Free[F, Unit] = Free.inject[DataOp, F](AddItem(name))
+
   def validateItem(item: String): Free[F, Boolean] = Free.inject[DataOp, F](ValidateItem(item))
+
   def getAllItems: Free[F, List[String]] = Free.inject[DataOp, F](GetAllItems())
 }
 
 object DataSource {
   implicit def instance[F[_]](implicit I: Inject[DataOp, F]) = new DataSource[F]
+}
+
+class ThirdLifting[F[_]](implicit I: Inject[SomethingElse, F]) {
+  def doSomethingElse: Free[F, Unit] = Free.inject[SomethingElse, F](DoSomethingElse())
+}
+
+object ThirdLifting {
+  implicit def instance[F[_]](implicit I: Inject[SomethingElse, F]) = new ThirdLifting[F]
 }
 
 // Coproduct
@@ -58,6 +72,7 @@ object ConsoleInteractions extends (Interaction ~> Task) {
 
 object InMemoryDataSource extends (DataOp ~> Task) {
   private[this] val dataSet: ListBuffer[String] = ListBuffer()
+
   override def apply[A](fa: DataOp[A]): Task[A] = fa match {
     case AddItem(name) => Task.delay {
       dataSet.append(name)
@@ -71,40 +86,51 @@ object InMemoryDataSource extends (DataOp ~> Task) {
   }
 }
 
+object SomethingElseWithConsoleAppenderAgain extends (SomethingElse ~> Task) {
+  override def apply[A](fa: SomethingElse[A]): Task[A] = fa match {
+    case DoSomethingElse() => Task.now {
+      println("Yay something else can be done")
+    }
+  }
+}
+
 // Main
 object CatsMain extends App {
-  type Application[A] = Coproduct[Interaction, DataOp, A]
-  val interpreters: Application ~> Task = ConsoleInteractions or InMemoryDataSource
+  type PartialApi[A] = Coproduct[DataOp, SomethingElse, A]
+  type Application[A] = Coproduct[Interaction, PartialApi, A]
 
-  import DataSource._
-  import Interactions._
+  val partialApiInterpreter: PartialApi ~> Task = InMemoryDataSource or SomethingElseWithConsoleAppenderAgain
+  val interpreter: Application ~> Task = ConsoleInteractions or partialApiInterpreter
+
   import cats.Monad
 
   implicit val taskMonad = new Monad[Task] {
     override def flatMap[A, B](fa: Task[A])(f: (A) => Task[B]): Task[B] = fa flatMap f
 
     @tailrec override def tailRecM[A, B](a: A)(f: (A) => Task[Either[A, B]]): Task[B] = f(a).unsafePerformSync match {
-      case Left(value)  => tailRecM(value)(f)
+      case Left(value) => tailRecM(value)(f)
       case Right(value) => Task.now(value)
     }
 
     override def pure[A](x: A): Task[A] = Task.now(x)
   }
 
-  def program(implicit I: Interactions[Application], D: DataSource[Application]): Free[Application, List[String]] = {
+  def program(implicit I: Interactions[Application], D: DataSource[Application], S: ThirdLifting[Application]): Free[Application, List[String]] = {
     import D._
     import I._
+    import S._
 
     for {
-      name      <- ask("Insert object name")
-      valid     <- validateItem(name)
-      _         <- if (valid) addItem(name) else tell(s"$name is not valid")
-      allItems  <- getAllItems
-      _         <- tell(allItems.mkString("\n"))
+      name <- ask("Insert object name")
+      _     <- doSomethingElse
+      valid <- validateItem(name)
+      _ <- if (valid) addItem(name) else tell(s"$name is not valid")
+      allItems <- getAllItems
+      _ <- tell(allItems.mkString("\n"))
     } yield allItems
   }
 
-  val result = (program foldMap interpreters).unsafePerformSyncAttempt.getOrElse(println("Error " + _))
+  val result = (program foldMap interpreter).unsafePerformSyncAttempt.getOrElse(println("Error " + _))
 
   println(result)
 }
